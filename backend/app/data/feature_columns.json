@@ -1,0 +1,17 @@
+[
+  "calories",
+  "carbs",
+  "fat",
+  "fiber",
+  "protein_target",
+  "sugar_target",
+  "sodium_target",
+  "age",
+  "has_weight_gain",
+  "has_hypertension",
+  "has_heart_disease",
+  "has_kidney_disease",
+  "has_diabetes",
+  "has_weight_loss",
+  "has_acne"
+]

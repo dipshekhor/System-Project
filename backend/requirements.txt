@@ -1,0 +1,43 @@
+# Core API
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+aiosqlite==0.20.0
+
+# Settings and validation
+pydantic==2.7.0
+pydantic-settings==2.2.1
+
+# ML / data
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.4.2
+joblib==1.4.2
+
+# Fuzzy matching
+fuzzywuzzy==0.18.0
+python-levenshtein==0.25.1
+
+# OCR / imaging
+pytesseract==0.3.10
+opencv-python-headless==4.9.0.80
+pillow==10.3.0
+
+# HTTP client
+httpx==0.27.0
+
+# Testing
+pytest==8.2.0
+pytest-asyncio==0.23.6
+
+# Environment
+python-dotenv==1.0.1
+
+passlib[bcrypt]==1.7.4    # hashes passwords — never store plain text
+bcrypt==4.0.1
+python-jose[cryptography]==3.3.0   # creates JWT tokens

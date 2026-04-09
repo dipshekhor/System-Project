@@ -1,0 +1,114 @@
+# ─── docker-compose.yml ───────────────────────────────────────────────────────
+# Spins up 3 containers that work together:
+#
+#   postgres  → PostgreSQL 16 database
+#   fastapi   → Our FastAPI app (built from Dockerfile)
+#   pgadmin   → Visual DB browser at http://localhost:5050
+#
+# Network:
+#   All containers share the 'food_network' bridge network.
+#   They reach each other by service name as hostname:
+#     fastapi → postgres:5432  (database connection)
+#     browser → localhost:8000 (API)
+#     browser → localhost:5050 (pgAdmin)
+#
+# Volumes:
+#   postgres_data → persists DB data between docker compose down/up
+#   ./app:/app/app → mounts our code so edits show without rebuild
+#
+# How to use:
+#   docker compose up --build    ← first time (builds FastAPI image)
+#   docker compose up            ← subsequent runs (no rebuild)
+#   docker compose down          ← stop containers (data persists)
+#   docker compose down -v       ← stop AND wipe DB data
+
+services:
+
+  # ── PostgreSQL 16 ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine         # alpine = smaller image (~80MB vs ~400MB)
+    container_name: food_app_db
+    restart: always                   # restart if container crashes
+    environment:
+      POSTGRES_USER:     foodapp
+      POSTGRES_PASSWORD: foodapp123
+      POSTGRES_DB:       food_recommendation
+    volumes:
+      # Named volume: data survives 'docker compose down' but not 'docker compose down -v'
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Expose port so you can connect from host with any DB client (DBeaver, psql, etc.)
+      - "5432:5432"
+    healthcheck:
+      # FastAPI container waits for this to pass before starting
+      # pg_isready returns 0 (success) when Postgres is accepting connections
+      test: ["CMD-SHELL", "pg_isready -U foodapp -d food_recommendation"]
+      interval: 10s      # check every 10 seconds
+      timeout: 5s        # fail if no response in 5 seconds
+      retries: 5         # mark unhealthy after 5 consecutive failures
+    networks:
+      - food_network
+
+  # ── FastAPI application ──────────────────────────────────────────────────────
+  fastapi:
+    build:
+      context: .           # build from current directory (where Dockerfile lives)
+      dockerfile: Dockerfile
+    container_name: food_app_api
+    restart: always
+    ports:
+      - "8000:8000"        # http://localhost:8000 → API
+    environment:
+      # asyncpg URL: postgresql+asyncpg://user:pass@host:port/dbname
+      # 'postgres' resolves to the postgres container via Docker DNS
+      DATABASE_URL: postgresql+asyncpg://foodapp:foodapp123@postgres:5432/food_recommendation
+      # Change this to a long random string in production!
+      SECRET_KEY: change_this_in_production_please
+    volumes:
+      # Hot-reload: mount app/ so Python file changes take effect without rebuild.
+      # When you save a .py file, Uvicorn (--reload) detects the change and restarts.
+      - ./app:/app/app
+      # Mount Alembic config/scripts so new revisions and template edits are visible in-container.
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    depends_on:
+      postgres:
+        # Wait for Postgres healthcheck to pass before starting FastAPI.
+        # Without this, FastAPI might try to connect before Postgres is ready.
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+    networks:
+      - food_network
+
+  # ── pgAdmin 4 (optional, visual DB browser) ──────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: food_app_pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@foodapp.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"              # http://localhost:5050
+    depends_on:
+      - postgres
+    networks:
+      - food_network
+    # pgAdmin stores its own config — persist it so you don't re-add the server every restart
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+# Managed by Docker (not tied to a host path). Survives container restarts.
+volumes:
+  postgres_data:
+  pgadmin_data:
+
+# ── Network ────────────────────────────────────────────────────────────────────
+networks:
+  food_network:
+    driver: bridge

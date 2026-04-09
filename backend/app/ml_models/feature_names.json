@@ -1,0 +1,15 @@
+[
+  "calories",
+  "protein",
+  "carbs",
+  "fat",
+  "fiber",
+  "sugar",
+  "sodium",
+  "cholesterol",
+  "has_obesity",
+  "has_hypertension",
+  "has_heart_disease",
+  "has_kidney_disease",
+  "has_diabetes"
+]

@@ -1,0 +1,17 @@
+# Phase 1 Requirements
+# Install with: pip install -r requirements_phase1.txt
+
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.4.2
+matplotlib==3.8.4
+fuzzywuzzy==0.18.0
+python-levenshtein==0.25.1
+pytesseract==0.3.10
+opencv-python==4.9.0.80
+pillow==10.3.0
+jupyter==1.0.0
+ipykernel==6.29.4
+passlib[bcrypt]==1.7.4    # hashes passwords — never store plain text
+bcrypt==4.0.1
+python-jose[cryptography]==3.3.0   # creates JWT tokens
