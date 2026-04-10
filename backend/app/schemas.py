@@ -178,6 +178,22 @@ class ImagePredictionRequest(BaseModel):
                                description="Model confidence score 0.0–1.0")
 
 
+class ImageModelPredictionResponse(BaseModel):
+    """
+    Response returned by the image-classification model endpoint.
+
+    Example:
+        {
+            "food_label": "spaghetti bolognese",
+            "confidence": 0.91,
+            "raw_food_label": "spaghetti_bolognese"
+        }
+    """
+    food_label: str = Field(..., min_length=1, max_length=300)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    raw_food_label: Optional[str] = None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Response schemas
 # ──────────────────────────────────────────────────────────────────────────────

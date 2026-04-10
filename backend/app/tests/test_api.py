@@ -300,11 +300,11 @@ async def test_image_valid(client, clean_profile):
 
 @pytest.mark.asyncio
 async def test_image_low_confidence(client, clean_profile):
-    """Image prediction with < 50% confidence returns 400."""
+    """Image prediction with < 20% confidence returns 400."""
     resp = await client.post("/api/analyze-image", json={
         "user_id":    clean_profile["id"],
         "food_label": "Banana",
-        "confidence": 0.35,   # below threshold
+        "confidence": 0.15,   # below threshold
     })
     assert resp.status_code == 400
 
