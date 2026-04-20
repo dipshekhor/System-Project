@@ -64,6 +64,11 @@ services:
       DATABASE_URL: postgresql+asyncpg://foodapp:foodapp123@postgres:5432/food_recommendation
       # Change this to a long random string in production!
       SECRET_KEY: change_this_in_production_please
+      # Phase 1 verification model (runtime-compatible, float32)
+      TEAMMATE_MODEL_PATH: /app/model_assets/food_model_v214_baseline.tflite
+      TEAMMATE_CLASS_NAMES_PATH: /app/model_assets/class_names.json
+      # Lowered for current model behavior; raise after retraining/calibration.
+      IMAGE_MIN_CONFIDENCE: "0.20"
     volumes:
       # Hot-reload: mount app/ so Python file changes take effect without rebuild.
       # When you save a .py file, Uvicorn (--reload) detects the change and restarts.
@@ -71,6 +76,9 @@ services:
       # Mount Alembic config/scripts so new revisions and template edits are visible in-container.
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
+      # Mount teammate image-model assets (.tflite + class names)
+      # Uses the backend-local model folder so files are always present in-container.
+      - ./model_assets_food:/app/model_assets:ro
     depends_on:
       postgres:
         # Wait for Postgres healthcheck to pass before starting FastAPI.

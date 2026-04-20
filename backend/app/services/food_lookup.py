@@ -23,6 +23,7 @@ Module design:
 import pandas as pd
 from fuzzywuzzy import process
 from pathlib import Path
+import re
 
 # ─── Module-level singletons ──────────────────────────────────────────────────
 # These are set by load() and used by lookup().
@@ -32,6 +33,24 @@ _food_names: list[str]   | None = None
 
 # Default data directory — override with load(data_dir=...) if needed
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
+
+
+def normalize_food_text(value: str) -> str:
+        """
+        Normalize food names so minor formatting differences do not affect matching.
+
+        Examples:
+            spaghetti_bolognese -> spaghetti bolognese
+            Spaghetti-Bolognese -> spaghetti bolognese
+            soy   beans         -> soy beans
+        """
+        if not value:
+                return ""
+        text = value.lower().strip()
+        text = text.replace("_", " ").replace("-", " ")
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
 
 def load(data_dir: Path | str | None = None) -> None:
@@ -81,12 +100,12 @@ def load(data_dir: Path | str | None = None) -> None:
         .str.strip("_")                              # strip leading/trailing _
     )
 
-    # ── Add lowercase version of food name for fuzzy matching ────────────────
-    # We match against lowercase to make matching case-insensitive
-    df["food_item_lower"] = df["food_item"].str.lower().str.strip()
+    # ── Add normalized version of food names for robust fuzzy matching ───────
+    # This handles underscore/hyphen/punctuation differences automatically.
+    df["food_item_search_key"] = df["food_item"].astype(str).map(normalize_food_text)
 
     _food_db    = df
-    _food_names = df["food_item_lower"].tolist()
+    _food_names = df["food_item_search_key"].tolist()
 
     print(f"✓ Food database loaded: {len(_food_db)} items from {csv_path.name}")
 
@@ -127,7 +146,7 @@ def lookup(query: str, threshold: int = 70) -> dict | None:
     if not query or not query.strip():
         return None
 
-    query_clean = query.lower().strip()
+    query_clean = normalize_food_text(query)
 
     # fuzzywuzzy.process.extractOne() returns (best_match_string, score)
     # WRatio is the default scorer — it handles partial matches, transpositions, etc.
@@ -138,7 +157,7 @@ def lookup(query: str, threshold: int = 70) -> dict | None:
         return None
 
     # Retrieve the matching row from the DataFrame
-    row = _food_db[_food_db["food_item_lower"] == match].iloc[0]
+    row = _food_db[_food_db["food_item_search_key"] == match].iloc[0]
 
     # Return a clean dict with standardized keys
     # These key names must match what medical_rules.py expects
@@ -180,7 +199,7 @@ def search_multiple(query: str, top_n: int = 5, threshold: int = 60) -> list[dic
     if _food_db is None:
         raise RuntimeError("Food database not loaded. Call food_lookup.load() first.")
 
-    query_clean = query.lower().strip()
+    query_clean = normalize_food_text(query)
 
     # process.extract() returns [(match_string, score), ...] for top N results
     matches = process.extract(query_clean, _food_names, limit=top_n)
@@ -189,7 +208,7 @@ def search_multiple(query: str, top_n: int = 5, threshold: int = 60) -> list[dic
     for match_str, score in matches:
         if score < threshold:
             continue
-        row = _food_db[_food_db["food_item_lower"] == match_str].iloc[0]
+        row = _food_db[_food_db["food_item_search_key"] == match_str].iloc[0]
         results.append({
             "food_item":   row["food_item"],
             "category":    row.get("category", ""),
