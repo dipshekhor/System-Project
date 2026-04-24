@@ -34,6 +34,27 @@ _food_names: list[str]   | None = None
 # Default data directory — override with load(data_dir=...) if needed
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data"
 
+# Synonym map: normalizes alternate names to the canonical DB food name (lowercase).
+# This ensures image model labels and manual search always resolve to the same entry.
+# Keys are post-normalization strings (lowercase, spaces only, no punctuation).
+_SYNONYMS: dict[str, str] = {
+    # hamburger → burger (image model predicts "hamburger"; DB canonical entry is "Burger")
+    "hamburger": "burger",
+    "beef burger": "burger",
+    "cheeseburger": "burger",
+    "cheese burger": "burger",
+    # "Macaroni & Cheese" normalizes to "macaroni cheese" (& stripped); image model uses
+    # "macaroni_and_cheese" → "macaroni and cheese" which hits "Macaroni And Cheese".
+    # Unify both manual variants to the same canonical DB entry.
+    "macaroni cheese": "macaroni and cheese",
+    "mac and cheese": "macaroni and cheese",
+    "mac cheese": "macaroni and cheese",
+    # "Spring Roll" (singular) vs "Spring Rolls" (plural) are separate DB rows with
+    # different nutritional data. Image model always predicts "spring_rolls" (plural),
+    # so unify manual singular input to the same entry.
+    "spring roll": "spring rolls",
+}
+
 
 def normalize_food_text(value: str) -> str:
         """
@@ -147,6 +168,10 @@ def lookup(query: str, threshold: int = 70) -> dict | None:
         return None
 
     query_clean = normalize_food_text(query)
+
+    # Resolve synonyms before fuzzy matching so "hamburger" and "burger" always
+    # hit the same DB row and produce the same verdict.
+    query_clean = _SYNONYMS.get(query_clean, query_clean)
 
     # fuzzywuzzy.process.extractOne() returns (best_match_string, score)
     # WRatio is the default scorer — it handles partial matches, transpositions, etc.

@@ -252,6 +252,10 @@ class VerdictResponse(BaseModel):
     # Image mode
     image_confidence: Optional[float] = None
 
+    # BMI-derived info (populated when height/weight are in profile)
+    bmi:      Optional[float] = None
+    bmi_note: Optional[str]   = None
+
     # DB primary key of the saved FoodCheck row
     check_id: Optional[int] = None
 
