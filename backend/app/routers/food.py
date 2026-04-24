@@ -140,8 +140,12 @@ async def check_food(
 
     # Step 3: Build profile dict (matches medical_rules.check_verdict signature)
     user_profile_dict = {
-        "diseases":  profile.diseases,   # list from JSON column
-        "allergies": profile.allergies,  # list from JSON column
+        "diseases":  profile.diseases,
+        "allergies": profile.allergies,
+        "age":       profile.age,
+        "gender":    profile.gender,
+        "height_cm": profile.height_cm,
+        "weight_kg": profile.weight_kg,
     }
 
     # Step 4: Run hybrid verdict (rules + ML)
@@ -182,6 +186,8 @@ async def check_food(
         food_info         = nutrients,
         ml_prediction     = result.get("ml_prediction"),
         ml_probabilities  = ml_probs,
+        bmi               = result.get("bmi"),
+        bmi_note          = result.get("bmi_note"),
         check_id          = check_id,
     )
 

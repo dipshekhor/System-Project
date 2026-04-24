@@ -154,9 +154,13 @@ async def _process_ocr_text(
 
     # ── Step 4: Build user profile dict ──────────────────────────────────────
     user_profile_dict = {
-        "diseases":          profile.diseases,
-        "allergies":         profile.allergies,
-        "ingredients_text":  ocr_text.lower(),  # for allergy check in medical_rules
+        "diseases":         profile.diseases,
+        "allergies":        profile.allergies,
+        "ingredients_text": ocr_text.lower(),
+        "age":              profile.age,
+        "gender":           profile.gender,
+        "height_cm":        profile.height_cm,
+        "weight_kg":        profile.weight_kg,
     }
 
     # ── Step 5: Run hybrid verdict ─────────────────────────────────────────────
@@ -187,6 +191,8 @@ async def _process_ocr_text(
         warnings            = result["warnings"],
         reasons             = result["reasons"],
         ml_prediction       = result.get("ml_prediction"),
+        bmi                 = result.get("bmi"),
+        bmi_note            = result.get("bmi_note"),
         ingredient_matches  = ingredient_matches,
         check_id            = check_id,
     )

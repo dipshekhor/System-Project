@@ -9,9 +9,11 @@ This is the HEART of the app. It answers one question:
 
 How it works:
   1. ALLERGY CHECK  → immediate hard block if any allergen found in ingredients
-  2. DISEASE RULES  → deduct from score based on nutrient violations per disease
-  3. POSITIVE BONUS → add points for fiber, protein, low sodium (healthy signals)
-  4. VERDICT        → safe (≥70), caution (40–69), avoid (<40)
+  2. BMI CHECK      → auto-inject Obesity if BMI ≥ 30; flag overweight if BMI ≥ 25
+  3. AGE/GENDER     → scale calorie + sodium limits to estimated TDEE
+  4. DISEASE RULES  → deduct from score based on nutrient violations per disease
+  5. POSITIVE BONUS → add points for fiber, protein, low sodium (healthy signals)
+  6. VERDICT        → safe (≥70), caution (40–69), avoid (<40)
 
 This is RULE-BASED (no ML here). The ML model in Phase 2 runs on top of this
 and blends its prediction for better accuracy. Rules always override ML for
@@ -19,8 +21,81 @@ critical safety violations like allergies.
 
 Data source: thresholds derived from Personalized_Diet_Recommendations.csv
   (75th percentile of recommended macros per disease = generous upper limit)
-  Combined with clinical guidelines (AHA, WHO, NKF).
+  Combined with clinical guidelines (AHA, WHO, NKF, Harris-Benedict).
 """
+
+# ─── BMI helpers ─────────────────────────────────────────────────────────────
+
+def compute_bmi(height_cm: float, weight_kg: float) -> float | None:
+    """Return BMI or None if inputs are missing/invalid."""
+    try:
+        h = float(height_cm)
+        w = float(weight_kg)
+        if h > 0 and w > 0:
+            return round(w / ((h / 100) ** 2), 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
+def _bmi_category(bmi: float | None) -> str:
+    """Return 'obese' | 'overweight' | 'normal'."""
+    if bmi is None:
+        return "normal"
+    if bmi >= 30:
+        return "obese"
+    if bmi >= 25:
+        return "overweight"
+    return "normal"
+
+
+# ─── Age/gender calorie + sodium scaling ─────────────────────────────────────
+#
+# Estimated daily calorie needs via simplified Harris-Benedict:
+#   Men   : 88.4 + 13.4×kg + 4.8×cm − 5.7×age  (sedentary ×1.2)
+#   Women : 447.6 + 9.2×kg + 3.1×cm − 4.3×age  (sedentary ×1.2)
+#
+# We then set the per-meal calorie limit = daily_need / 3 (3 meals/day).
+# The Obesity rule default is 500 kcal; we replace it with this value.
+#
+# Sodium: AHA recommends stricter limits for people over 50 (cardiovascular
+# risk rises sharply). Default Hypertension limit is 600 mg; we tighten it
+# to 500 mg for age ≥ 50.
+
+def _estimate_daily_calories(age: int, gender: str, height_cm: float, weight_kg: float) -> float | None:
+    """Return estimated daily sedentary calorie need, or None if inputs missing."""
+    try:
+        a = float(age)
+        h = float(height_cm)
+        w = float(weight_kg)
+        if a <= 0 or h <= 0 or w <= 0:
+            return None
+        g = str(gender).lower()
+        if g in ("male", "m"):
+            bmr = 88.4 + 13.4 * w + 4.8 * h - 5.7 * a
+        else:
+            bmr = 447.6 + 9.2 * w + 3.1 * h - 4.3 * a
+        return round(bmr * 1.2, 0)   # sedentary activity factor
+    except (TypeError, ValueError):
+        return None
+
+
+def _per_meal_calorie_limit(daily_calories: float | None) -> int:
+    """One-third of daily need, clamped to [350, 700]."""
+    if daily_calories is None:
+        return 500   # fallback default
+    return max(350, min(700, round(daily_calories / 3)))
+
+
+def _sodium_limit_for_hypertension(age: int | None) -> int:
+    """Stricter sodium cap for hypertension patients over 50."""
+    try:
+        if age is not None and int(age) >= 50:
+            return 500
+    except (TypeError, ValueError):
+        pass
+    return 600   # default
+
 
 # ─── Allergy keyword map ──────────────────────────────────────────────────────
 # Maps each allergy name (as it appears in the dataset) to a list of ingredient
@@ -223,23 +298,30 @@ def _check_allergy(ingredients_text: str, allergies: list[str]) -> dict | None:
 
 def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
     """
-    Main verdict function. Combines allergy check + disease rules + positive bonuses.
+    Main verdict function. Combines allergy check + BMI injection +
+    age/gender scaling + disease rules + positive bonuses.
 
     Args:
         food_nutrients: dict with keys:
             calories, protein, carbs, fat, fiber, sugar,
             sodium, cholesterol, ingredients_text (optional)
         user_profile: dict with keys:
-            diseases  (list of str) e.g. ["Diabetes", "Hypertension"]
-            allergies (list of str) e.g. ["Nut Allergy"]
+            diseases   (list of str) e.g. ["Diabetes", "Hypertension"]
+            allergies  (list of str) e.g. ["Nut Allergy"]
+            age        (int,   optional) used to scale sodium limit
+            gender     (str,   optional) "male"/"female" for calorie scaling
+            height_cm  (float, optional) for BMI computation
+            weight_kg  (float, optional) for BMI computation
 
     Returns:
         {
-          "verdict":  "safe" | "caution" | "avoid",
-          "score":    int (0–100),
-          "warnings": list[str],   # reasons the food is bad
-          "reasons":  list[str],   # reasons the food is good
-          "allergy_block": bool    # True = skip ML, hard block
+          "verdict":      "safe" | "caution" | "avoid",
+          "score":        int (0–100),
+          "warnings":     list[str],
+          "reasons":      list[str],
+          "allergy_block": bool,
+          "bmi":          float | None,
+          "bmi_note":     str | None,
         }
 
     Scoring:
@@ -252,32 +334,77 @@ def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
     reasons:  list[str] = []
     score: int = 100
 
-    diseases:  list[str] = user_profile.get("diseases",  [])
+    diseases:  list[str] = list(user_profile.get("diseases",  []))
     allergies: list[str] = user_profile.get("allergies", [])
     ingredients_text: str = food_nutrients.get("ingredients_text", "")
+
+    age       = user_profile.get("age")
+    gender    = user_profile.get("gender", "")
+    height_cm = user_profile.get("height_cm")
+    weight_kg = user_profile.get("weight_kg")
 
     # ── Step 1: Hard allergy block ────────────────────────────────────────────
     allergy_result = _check_allergy(ingredients_text, allergies)
     if allergy_result:
-        return allergy_result  # immediate return, no further checks needed
+        return allergy_result
 
-    # ── Step 2: Disease rule violations ──────────────────────────────────────
+    # ── Step 2: BMI auto-injection ────────────────────────────────────────────
+    bmi      = compute_bmi(height_cm, weight_kg)
+    bmi_note = None
+    bmi_cat  = _bmi_category(bmi)
+
+    if bmi_cat == "obese" and "Obesity" not in diseases:
+        diseases.append("Obesity")
+        bmi_note = (
+            f"Obesity rules applied automatically (BMI {bmi} ≥ 30). "
+            "Add 'Obesity' to your profile to silence this notice."
+        )
+        warnings.append(f"⚠ BMI {bmi} indicates obesity — calorie and fat limits applied")
+
+    elif bmi_cat == "overweight":
+        # Softer penalty: deduct 10 points if calories or fat are high
+        cal_val = float(food_nutrients.get("calories", 0))
+        fat_val = float(food_nutrients.get("fat", 0))
+        if cal_val > 600 or fat_val > 25:
+            score -= 10
+            warnings.append(
+                f"Moderately high calorie/fat content — worth monitoring "
+                f"(BMI {bmi}, overweight range)"
+            )
+        bmi_note = f"BMI {bmi} — overweight range. Lighter portions recommended."
+
+    # ── Step 3: Age/gender-adjusted calorie + sodium limits ───────────────────
+    daily_cal   = _estimate_daily_calories(age, gender, height_cm, weight_kg)
+    meal_cal_limit  = _per_meal_calorie_limit(daily_cal)
+    htn_sodium_limit = _sodium_limit_for_hypertension(age)
+
+    # Build a patched copy of DISEASE_RULES with personalised limits
+    personalized_rules: dict[str, list[dict]] = {}
+    for disease, rules in DISEASE_RULES.items():
+        patched = []
+        for rule in rules:
+            r = dict(rule)
+            if disease == "Obesity" and r["nutrient"] == "calories":
+                r = {**r, "max": meal_cal_limit}
+            if disease == "Hypertension" and r["nutrient"] == "sodium":
+                r = {**r, "max": htn_sodium_limit}
+            patched.append(r)
+        personalized_rules[disease] = patched
+
+    # ── Step 4: Disease rule violations ──────────────────────────────────────
     for disease in diseases:
-        rules = DISEASE_RULES.get(disease, [])
+        rules = personalized_rules.get(disease, [])
         for rule in rules:
             nutrient = rule["nutrient"]
             value    = float(food_nutrients.get(nutrient, 0))
 
-            # Check max limit (penalty if exceeded)
             if "max" in rule and value > rule["max"]:
                 warnings.append(
                     f"{rule['message']} "
-                    f"(this food: {value:.1f}, limit: {rule['max']})"
+                    f"(this food: {value:.1f}, your limit: {rule['max']})"
                 )
                 score -= rule["penalty"]
 
-            # Check min requirement (penalty if below)
-            # (Currently only used for positive rules, but structure supports it)
             if "min" in rule and value < rule["min"]:
                 warnings.append(
                     f"Insufficient {nutrient} for {disease} "
@@ -285,23 +412,20 @@ def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
                 )
                 score -= rule["penalty"]
 
-    # ── Step 3: Positive nutrient bonuses ────────────────────────────────────
+    # ── Step 5: Positive nutrient bonuses ────────────────────────────────────
     for rule in POSITIVE_RULES:
         nutrient = rule["nutrient"]
         value    = float(food_nutrients.get(nutrient, 0))
 
-        # Bonus for being below a good threshold
         if "max" in rule and value <= rule["max"]:
             reasons.append(rule["message"])
             score += rule["bonus"]
-
-        # Bonus for being above a good minimum
         elif "min" in rule and value >= rule["min"]:
             reasons.append(rule["message"])
             score += rule["bonus"]
 
-    # ── Step 4: Clamp score and assign verdict ────────────────────────────────
-    score = max(0, min(100, score))   # keep in [0, 100]
+    # ── Step 6: Clamp score and assign verdict ────────────────────────────────
+    score = max(0, min(100, score))
 
     if score >= 70:
         verdict = "safe"
@@ -316,6 +440,8 @@ def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
         "warnings":      warnings,
         "reasons":       reasons,
         "allergy_block": False,
+        "bmi":           bmi,
+        "bmi_note":      bmi_note,
     }
 
 
@@ -438,5 +564,97 @@ if __name__ == "__main__":
     print(f"  Verdict : {result4['verdict']}  (expected: avoid)")
     print(f"  Score   : {result4['score']}")
     print(f"  Warnings: {result4['warnings']}")
+
+    # ── NEW: BMI + age/gender tests ───────────────────────────────────────────
+
+    # Test 5: Obese user (BMI 33) who did NOT select Obesity disease
+    # → should auto-inject Obesity rules and penalise high-cal food
+    result5 = check_verdict(
+        food_nutrients={"calories": 600, "fat": 25, "sodium": 200,
+                        "sugar": 8, "cholesterol": 40, "carbs": 50,
+                        "protein": 15, "fiber": 2, "ingredients_text": ""},
+        user_profile={
+            "diseases": [], "allergies": [],
+            "height_cm": 170, "weight_kg": 95,   # BMI ≈ 32.9
+            "age": 35, "gender": "male",
+        },
+    )
+    bmi5 = compute_bmi(170, 95)
+    print(f"\nTest 5 — Obese user (BMI {bmi5}), no diseases selected, high-cal food")
+    print(f"  Verdict  : {result5['verdict']}  (expected: caution or avoid)")
+    print(f"  Score    : {result5['score']}")
+    print(f"  BMI      : {result5['bmi']}")
+    print(f"  BMI note : {result5['bmi_note']}")
+    print(f"  Warnings : {result5['warnings']}")
+
+    # Test 6: Overweight user — lighter penalty only
+    result6 = check_verdict(
+        food_nutrients={"calories": 650, "fat": 28, "sodium": 200,
+                        "sugar": 6, "cholesterol": 30, "carbs": 45,
+                        "protein": 20, "fiber": 5, "ingredients_text": ""},
+        user_profile={
+            "diseases": [], "allergies": [],
+            "height_cm": 175, "weight_kg": 85,   # BMI ≈ 27.8
+            "age": 40, "gender": "female",
+        },
+    )
+    bmi6 = compute_bmi(175, 85)
+    print(f"\nTest 6 — Overweight user (BMI {bmi6}), high-cal food")
+    print(f"  Verdict  : {result6['verdict']}  (expected: caution, soft penalty)")
+    print(f"  Score    : {result6['score']}")
+    print(f"  BMI note : {result6['bmi_note']}")
+    print(f"  Warnings : {result6['warnings']}")
+
+    # Test 7: Age/gender calorie scaling — older woman gets stricter calorie limit
+    result7 = check_verdict(
+        food_nutrients={"calories": 520, "fat": 15, "sodium": 300,
+                        "sugar": 5, "cholesterol": 40, "carbs": 50,
+                        "protein": 20, "fiber": 5, "ingredients_text": ""},
+        user_profile={
+            "diseases": ["Obesity"], "allergies": [],
+            "height_cm": 158, "weight_kg": 72,
+            "age": 60, "gender": "female",
+        },
+    )
+    daily7 = _estimate_daily_calories(60, "female", 158, 72)
+    meal_limit7 = _per_meal_calorie_limit(daily7)
+    print(f"\nTest 7 — 60yr female, Obesity, 520 kcal food")
+    print(f"  Daily estimate : {daily7} kcal  →  per-meal limit: {meal_limit7} kcal")
+    print(f"  Verdict        : {result7['verdict']}")
+    print(f"  Score          : {result7['score']}")
+    print(f"  Warnings       : {result7['warnings']}")
+
+    # Test 8: Hypertension + age 55 → stricter sodium limit (500mg not 600mg)
+    result8 = check_verdict(
+        food_nutrients={"calories": 300, "fat": 10, "sodium": 540,
+                        "sugar": 4, "cholesterol": 30, "carbs": 30,
+                        "protein": 18, "fiber": 3, "ingredients_text": ""},
+        user_profile={
+            "diseases": ["Hypertension"], "allergies": [],
+            "height_cm": 172, "weight_kg": 78,
+            "age": 55, "gender": "male",
+        },
+    )
+    print(f"\nTest 8 — Hypertension, age 55, 540mg sodium food")
+    print(f"  Sodium limit applied: {_sodium_limit_for_hypertension(55)}mg  (expected: 500mg)")
+    print(f"  Verdict  : {result8['verdict']}  (expected: caution/avoid — 540 > 500)")
+    print(f"  Score    : {result8['score']}")
+    print(f"  Warnings : {result8['warnings']}")
+
+    # Same food, younger user — 540mg should be under the 600mg default limit
+    result8b = check_verdict(
+        food_nutrients={"calories": 300, "fat": 10, "sodium": 540,
+                        "sugar": 4, "cholesterol": 30, "carbs": 30,
+                        "protein": 18, "fiber": 3, "ingredients_text": ""},
+        user_profile={
+            "diseases": ["Hypertension"], "allergies": [],
+            "height_cm": 172, "weight_kg": 78,
+            "age": 30, "gender": "male",
+        },
+    )
+    print(f"\nTest 8b — Same food, age 30 (limit 600mg)")
+    print(f"  Sodium limit applied: {_sodium_limit_for_hypertension(30)}mg  (expected: 600mg)")
+    print(f"  Verdict  : {result8b['verdict']}  (expected: safe — 540 < 600)")
+    print(f"  Warnings : {result8b['warnings']}")
 
     print("\n✓ All tests complete.")

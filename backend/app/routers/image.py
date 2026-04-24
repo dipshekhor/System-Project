@@ -173,6 +173,10 @@ async def analyze_image(
     user_profile_dict = {
         "diseases":  profile.diseases,
         "allergies": profile.allergies,
+        "age":       profile.age,
+        "gender":    profile.gender,
+        "height_cm": profile.height_cm,
+        "weight_kg": profile.weight_kg,
     }
 
     # ── Step 5: Run hybrid verdict ─────────────────────────────────────────────
@@ -213,6 +217,8 @@ async def analyze_image(
         food_info        = nutrients,
         ml_prediction    = result.get("ml_prediction"),
         ml_probabilities = ml_probs,
+        bmi              = result.get("bmi"),
+        bmi_note         = result.get("bmi_note"),
         image_confidence = req.confidence,
         check_id         = check_id,
     )
@@ -302,7 +308,14 @@ async def analyze_food_photo(
             detail=f"Predicted '{food_label}' not in food database."
         )
 
-    user_profile_dict = {"diseases": profile.diseases, "allergies": profile.allergies}
+    user_profile_dict = {
+        "diseases":  profile.diseases,
+        "allergies": profile.allergies,
+        "age":       profile.age,
+        "gender":    profile.gender,
+        "height_cm": profile.height_cm,
+        "weight_kg": profile.weight_kg,
+    }
     result = hybrid_verdict(nutrients, user_profile_dict, ml_model.predict)
 
     check_id = await _save_check(
@@ -323,6 +336,8 @@ async def analyze_food_photo(
         reasons          = result["reasons"],
         food_info        = nutrients,
         ml_prediction    = result.get("ml_prediction"),
+        bmi              = result.get("bmi"),
+        bmi_note         = result.get("bmi_note"),
         image_confidence = confidence,
         check_id         = check_id,
     )
