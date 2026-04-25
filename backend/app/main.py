@@ -28,7 +28,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import auth
 from app.database import engine, Base
-from app.routers import profile, food, ocr, image
+from app.routers import profile, food, ocr, image, blog
 from app.services import food_lookup, ml_model
 
 
@@ -117,6 +117,7 @@ app.include_router(food.router,    prefix="/api", tags=["Food Check"])
 app.include_router(ocr.router,     prefix="/api", tags=["OCR"])
 app.include_router(image.router,   prefix="/api", tags=["Image"])
 app.include_router(auth.router, prefix="/api", tags=["Auth"])
+app.include_router(blog.router, prefix="/api", tags=["Blog"])
 
 
 

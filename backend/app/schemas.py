@@ -293,3 +293,47 @@ class HistoryDetail(HistoryItem):
 
     class Config:
         from_attributes = True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Blog schemas
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BlogPostCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    body:  str = Field(..., min_length=1, max_length=10000)
+
+
+class BlogAnswerCreate(BaseModel):
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+class BlogAnswerOut(BaseModel):
+    id:          int
+    post_id:     int
+    user_id:     int
+    author_name: str
+    body:        str
+    created_at:  datetime
+
+
+class BlogPostSummary(BaseModel):
+    id:           int
+    user_id:      int
+    author_name:  str
+    title:        str
+    answer_count: int
+    created_at:   datetime
+    updated_at:   datetime
+
+
+class BlogPostDetail(BaseModel):
+    id:           int
+    user_id:      int
+    author_name:  str
+    title:        str
+    body:         str
+    answer_count: int
+    answers:      list[BlogAnswerOut]
+    created_at:   datetime
+    updated_at:   datetime
