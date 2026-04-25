@@ -30,7 +30,7 @@ from sqlalchemy import select, delete
 from app.database import get_db
 from app.models import UserProfile, FoodCheck
 from app.schemas import ManualFoodRequest, VerdictResponse, HistoryItem, HistoryDetail
-from app.services import food_lookup, ml_model
+from app.services import food_lookup, ml_model, personalized_nutrition
 from app.services.medical_rules import hybrid_verdict
 
 router = APIRouter()
@@ -54,6 +54,76 @@ async def _get_profile_or_404(user_id: int, db: AsyncSession) -> UserProfile:
                    f"Please create a profile first via POST /api/profile"
         )
     return profile
+
+
+def _profile_to_personalized_dict(profile) -> dict:
+    """
+    Build the dict shape expected by personalized_nutrition.predict_user_targets.
+    Maps the SQL column names (height_cm/weight_kg) to the engine's keys
+    (height/weight) and forwards the disease list.
+    """
+    return {
+        "age":            profile.age,
+        "gender":         profile.gender,
+        "height":         profile.height_cm,
+        "weight":         profile.weight_kg,
+        "activity_level": getattr(profile, "activity_level", None),
+        "diseases":       profile.diseases or [],
+    }
+
+
+def _enrich_result(result: dict, nutrients: dict | None, profile) -> dict:
+    """
+    Add user_targets + budget_impact to the verdict result and append any
+    personalized reasoning to the existing reasons list.
+
+    Returns the same `result` dict, mutated. Safe to call when nutrients is
+    None or empty (skips silently — used by OCR when no ingredients matched).
+    """
+    if not nutrients:
+        return result
+    try:
+        extras = personalized_nutrition.enrich_with_targets(
+            food_nutrients = nutrients,
+            user_profile   = _profile_to_personalized_dict(profile),
+        )
+    except Exception as exc:
+        # Personalized engine is best-effort — don't fail the whole verdict
+        # if the model isn't loaded or a prediction errors.
+        print(f"[personalized] enrichment skipped: {exc}")
+        return result
+
+    result["user_targets"]  = extras["user_targets"]
+    result["budget_impact"] = extras["budget_impact"]
+
+    # Personalized warnings → result.warnings (not reasons!)
+    existing_warnings = set(result.get("warnings", []))
+    for w in extras["personalized_warnings"]:
+        if w not in existing_warnings:
+            result.setdefault("warnings", []).append(w)
+            existing_warnings.add(w)
+
+    # Personalized positive reasons → result.reasons
+    existing_reasons = set(result.get("reasons", []))
+    for r in extras["personalized_reasons"]:
+        if r not in existing_reasons:
+            result.setdefault("reasons", []).append(r)
+            existing_reasons.add(r)
+
+    # Blend the score: average rule-based score with personalized score so a
+    # food that exceeds the user's daily budgets actually drops the verdict.
+    rule_score = int(result.get("score", 100))
+    pers_score = int(extras["personalized_score"])
+    blended    = max(0, min(100, round((rule_score + pers_score) / 2)))
+    result["score"] = blended
+    if blended >= 70:
+        result["verdict"] = "safe"
+    elif blended >= 40:
+        result["verdict"] = "caution"
+    else:
+        result["verdict"] = "avoid"
+
+    return result
 
 
 async def _save_check(
@@ -156,6 +226,9 @@ async def check_food(
         ml_predict_fn   = ml_model.predict,
     )
 
+    # Step 4b: Layer on personalized daily-target context (budget impact + reasons)
+    _enrich_result(result, nutrients, profile)
+
     # Also get ML probability breakdown for UI display
     disease_flags = {
         "has_" + d.lower().replace(" ", "_"): 1
@@ -189,6 +262,8 @@ async def check_food(
         bmi               = result.get("bmi"),
         bmi_note          = result.get("bmi_note"),
         check_id          = check_id,
+        user_targets      = result.get("user_targets"),
+        budget_impact     = result.get("budget_impact"),
     )
 
 

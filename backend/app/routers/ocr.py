@@ -43,7 +43,7 @@ from app.services.ocr_pipeline import (
     find_ingredients_section,
     clean_ocr_text,
 )
-from app.routers.food import _get_profile_or_404, _save_check
+from app.routers.food import _get_profile_or_404, _save_check, _enrich_result
 
 router = APIRouter()
 
@@ -170,6 +170,17 @@ async def _process_ocr_text(
         ml_predict_fn  = ml_model.predict,
     )
 
+    # ── Step 5b: Personalized daily-target context ───────────────────────────
+    # Strip the non-numeric ingredients_text key before computing budget impact.
+    nutrients_only = {k: v for k, v in combined_nutrients.items() if k != "ingredients_text"}
+    _enrich_result(result, nutrients_only, profile)
+
+    # Build the food_info shape the frontend ResultScreen expects
+    food_info = {
+        "food_item": f"Scanned ingredients ({found_count}/{len(ingredients)})",
+        **nutrients_only,
+    }
+
     # Attach ingredient match details to result
     result["ingredient_matches"] = ingredient_matches
     result["ingredients_found"]  = f"{found_count}/{len(ingredients)}"
@@ -190,11 +201,14 @@ async def _process_ocr_text(
         score               = result["score"],
         warnings            = result["warnings"],
         reasons             = result["reasons"],
+        food_info           = food_info,
         ml_prediction       = result.get("ml_prediction"),
         bmi                 = result.get("bmi"),
         bmi_note            = result.get("bmi_note"),
         ingredient_matches  = ingredient_matches,
         check_id            = check_id,
+        user_targets        = result.get("user_targets"),
+        budget_impact       = result.get("budget_impact"),
     )
 
 

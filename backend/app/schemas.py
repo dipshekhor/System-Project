@@ -259,6 +259,14 @@ class VerdictResponse(BaseModel):
     # DB primary key of the saved FoodCheck row
     check_id: Optional[int] = None
 
+    # ── Personalized nutrition engine output ──────────────────────────────────
+    # user_targets:  predicted daily nutrient limits for THIS user
+    #                {"target_calories": 2150, "target_sodium": 1500, ...}
+    # budget_impact: fraction of each daily target this food consumes
+    #                {"calories": 0.17, "sodium": 0.48, ...}
+    user_targets:  Optional[dict] = None
+    budget_impact: Optional[dict] = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # History schemas
