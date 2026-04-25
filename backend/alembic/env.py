@@ -33,6 +33,15 @@ Async note:
 import asyncio
 import os
 from logging.config import fileConfig
+from pathlib import Path
+
+# Load .env so DATABASE_URL is available when running alembic from the host.
+# python-dotenv is a dev dependency; if it's not installed this is a no-op.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    pass
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -51,7 +60,6 @@ if config.config_file_name is not None:
 # Line 2: imports the actual model classes — this registers them in Base.metadata
 #          Without this line, autogenerate produces empty migrations.
 import sys
-from pathlib import Path
 # Add backend/ to path so 'from app.database import Base' works
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
