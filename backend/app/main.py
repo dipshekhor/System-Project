@@ -28,8 +28,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import auth
 from app.database import engine, Base
-from app.routers import profile, food, ocr, image, blog
-from app.services import food_lookup, ml_model
+from app.routers import profile, food, ocr, image, blog, personalized
+from app.services import food_lookup, ml_model, personalized_nutrition
 
 
 @asynccontextmanager
@@ -68,6 +68,14 @@ async def lifespan(app: FastAPI):
         print("⚠ ML model not found. Training now (first run only)...")
         ml_model.train_and_save()
         ml_model.load()
+
+    # Personalized nutrition engine (multi-output regressor → daily targets)
+    try:
+        personalized_nutrition.load()
+    except FileNotFoundError:
+        print("⚠ Personalized nutrition model not found. Training now...")
+        personalized_nutrition.train_and_save()
+        personalized_nutrition.load()
 
     print("✓ Server ready. Visit http://localhost:8000/docs")
 
@@ -118,6 +126,7 @@ app.include_router(ocr.router,     prefix="/api", tags=["OCR"])
 app.include_router(image.router,   prefix="/api", tags=["Image"])
 app.include_router(auth.router, prefix="/api", tags=["Auth"])
 app.include_router(blog.router, prefix="/api", tags=["Blog"])
+app.include_router(personalized.router, prefix="/api", tags=["Personalized Nutrition"])
 
 
 

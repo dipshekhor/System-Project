@@ -1,0 +1,13 @@
+[
+  "age",
+  "gender",
+  "height",
+  "weight",
+  "bmi",
+  "activity_level",
+  "is_diabetes",
+  "is_hypertension",
+  "is_heart",
+  "is_weight_gain",
+  "is_kidney"
+]

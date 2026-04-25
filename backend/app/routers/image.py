@@ -37,7 +37,7 @@ from app.schemas import ImagePredictionRequest, ImageModelPredictionResponse, Ve
 from app.services import food_lookup, ml_model
 from app.services import image_model_tflite
 from app.services.medical_rules import hybrid_verdict
-from app.routers.food import _get_profile_or_404, _save_check
+from app.routers.food import _get_profile_or_404, _save_check, _enrich_result
 
 router = APIRouter()
 
@@ -186,6 +186,9 @@ async def analyze_image(
         ml_predict_fn  = ml_model.predict,
     )
 
+    # ── Step 5b: Personalized daily-target context ───────────────────────────
+    _enrich_result(result, nutrients, profile)
+
     # Also get ML probabilities
     disease_flags = {
         "has_" + d.lower().replace(" ", "_"): 1
@@ -221,6 +224,8 @@ async def analyze_image(
         bmi_note         = result.get("bmi_note"),
         image_confidence = req.confidence,
         check_id         = check_id,
+        user_targets     = result.get("user_targets"),
+        budget_impact    = result.get("budget_impact"),
     )
 
 
@@ -317,6 +322,7 @@ async def analyze_food_photo(
         "weight_kg": profile.weight_kg,
     }
     result = hybrid_verdict(nutrients, user_profile_dict, ml_model.predict)
+    _enrich_result(result, nutrients, profile)
 
     check_id = await _save_check(
         db             = db,
@@ -340,4 +346,6 @@ async def analyze_food_photo(
         bmi_note         = result.get("bmi_note"),
         image_confidence = confidence,
         check_id         = check_id,
+        user_targets     = result.get("user_targets"),
+        budget_impact    = result.get("budget_impact"),
     )

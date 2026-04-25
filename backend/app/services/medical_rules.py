@@ -392,6 +392,9 @@ def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
         personalized_rules[disease] = patched
 
     # ── Step 4: Disease rule violations ──────────────────────────────────────
+    # Score deductions are applied silently here; the personalized budget-impact
+    # messages from generate_reasoning (via _enrich_result) carry the user-facing
+    # explanation, so we don't double-report with the static limit strings.
     for disease in diseases:
         rules = personalized_rules.get(disease, [])
         for rule in rules:
@@ -399,17 +402,9 @@ def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
             value    = float(food_nutrients.get(nutrient, 0))
 
             if "max" in rule and value > rule["max"]:
-                warnings.append(
-                    f"{rule['message']} "
-                    f"(this food: {value:.1f}, your limit: {rule['max']})"
-                )
                 score -= rule["penalty"]
 
             if "min" in rule and value < rule["min"]:
-                warnings.append(
-                    f"Insufficient {nutrient} for {disease} "
-                    f"(this food: {value:.1f}, need ≥{rule['min']})"
-                )
                 score -= rule["penalty"]
 
     # ── Step 5: Positive nutrient bonuses ────────────────────────────────────
@@ -442,6 +437,112 @@ def check_verdict(food_nutrients: dict, user_profile: dict) -> dict:
         "allergy_block": False,
         "bmi":           bmi,
         "bmi_note":      bmi_note,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Personalized "budget impact" reasoning
+# ──────────────────────────────────────────────────────────────────────────────
+# Used by services/personalized_nutrition.check_personalized_verdict().
+# Different from check_verdict() above:
+#   check_verdict      → static thresholds (e.g. "sodium > 600mg = bad")
+#   generate_reasoning → compares against the USER's predicted daily target
+#                        (e.g. "this food consumes 42% of YOUR sodium budget")
+#
+# Disease sensitivities tighten the warning threshold for nutrients the
+# condition is most affected by (sodium for hypertension, sugar for diabetes…).
+_SENSITIVITY_MAP: dict[str, list[str]] = {
+    "is_diabetes":     ["target_sugar", "target_carbs"],
+    "is_hypertension": ["target_sodium", "target_cholesterol"],
+    "is_heart":        ["target_fat", "target_cholesterol", "target_sodium"],
+    "is_kidney":       ["target_sodium", "target_protein"],
+    "is_weight_gain":  ["target_calories", "target_fat", "target_sugar"],
+}
+
+
+def generate_reasoning(
+    food_nutrients: dict,
+    user_targets:   dict,
+    user_profile:   dict,
+) -> dict:
+    """
+    Compare a food's nutrients against a user's PERSONAL daily targets.
+    Returns warnings (over-budget violations) and positive reasons separately
+    so the frontend can route them to the correct UI sections.
+
+    Args:
+        food_nutrients: {"calories": 320, "protein": 12, ...}
+        user_targets:   {"target_calories": 2150, "target_protein": 108, ...}
+        user_profile:   binary disease flags
+                        {"is_diabetes": 1, "is_hypertension": 0, ...}
+
+    Returns:
+        {"verdict": "Safe"|"Caution"|"Avoid",
+         "score":   int 0-100,
+         "warnings": list[str],     # over-budget / disease-sensitive concerns
+         "reasons":  list[str]}     # positive reasons only
+
+    Scoring:
+      Start at 100. Each high-impact nutrient deducts points proportional
+      to its share of the daily target (capped per-nutrient so a single
+      runaway value can't dominate). Disease-sensitive nutrients use a
+      tighter 20% threshold and deduct an extra 15. Positive bonuses
+      (high fiber, high protein) add a few points back.
+    """
+    warnings: list[str] = []
+    reasons:  list[str] = []
+    score: float = 100.0
+
+    for nutrient, food_val in food_nutrients.items():
+        target_key = f"target_{nutrient}"
+        limit = user_targets.get(target_key, 0)
+        if not limit or limit <= 0:
+            continue
+
+        try:
+            food_val = float(food_val or 0)
+        except (TypeError, ValueError):
+            continue
+        impact = food_val / limit
+        # Cap impact display at 999% so a unit-mismatched outlier reads sanely
+        impact_pct = min(impact, 9.99)
+
+        # Generic score deduction: > 30% of daily limit in a single food item
+        if impact > 0.30:
+            # Cap deduction so a single runaway nutrient can't go past 25 points
+            score -= min(25.0, impact * 20)
+
+        # Stricter rule for disease-sensitive nutrients
+        for disease, sensitive in _SENSITIVITY_MAP.items():
+            if user_profile.get(disease) == 1 and target_key in sensitive and impact > 0.20:
+                pretty = disease.replace("is_", "").replace("_", " ")
+                warnings.append(
+                    f"Critical for {pretty}: too much {nutrient} "
+                    f"({impact_pct:.0%} of daily target)."
+                )
+                score -= 15
+
+    # Positive reasons
+    if float(food_nutrients.get("fiber", 0) or 0) > 5:
+        reasons.append("Good source of fibre.")
+        score += 5
+    if float(food_nutrients.get("protein", 0) or 0) > 20:
+        reasons.append("Good source of protein.")
+        score += 3
+
+    score = max(0, min(100, int(round(score))))
+    if score >= 70:
+        verdict = "Safe"
+    elif score >= 40:
+        verdict = "Caution"
+    else:
+        verdict = "Avoid"
+
+    return {
+        "verdict":  verdict,
+        "score":    score,
+        "warnings": warnings,
+        "reasons":  reasons,
     }
 
 
