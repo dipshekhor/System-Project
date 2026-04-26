@@ -514,7 +514,7 @@ def generate_reasoning(
 
         # Stricter rule for disease-sensitive nutrients
         for disease, sensitive in _SENSITIVITY_MAP.items():
-            if user_profile.get(disease) == 1 and target_key in sensitive and impact > 0.20:
+            if user_profile.get(disease) == 1 and target_key in sensitive and impact > 0.30:
                 pretty = disease.replace("is_", "").replace("_", " ")
                 warnings.append(
                     f"Critical for {pretty}: too much {nutrient} "

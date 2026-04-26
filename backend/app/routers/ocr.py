@@ -43,6 +43,7 @@ from app.services.ocr_pipeline import (
     find_ingredients_section,
     clean_ocr_text,
 )
+from app.services.ocr_service import process_ocr_image
 from app.routers.food import _get_profile_or_404, _save_check, _enrich_result
 
 router = APIRouter()
@@ -278,3 +279,114 @@ async def analyze_ocr_image(
         )
 
     return await _process_ocr_text(ocr_text, user_id, profile, db)
+
+
+# ─── Endpoint C: Nutrition-facts image (bilingual two-tier OCR) ──────────────
+
+@router.post(
+    "/analyze-nutrition-image",
+    response_model=VerdictResponse,
+    summary="Analyze nutrition-facts panel (bilingual two-tier OCR)",
+    description="Receives JPEG/PNG image of the nutrition-facts panel. "
+                "Runs Google Cloud Vision (Tier 1) with Tesseract fallback (Tier 2), "
+                "extracts bilingual (English + Bangla) nutrient values, then runs "
+                "the medical-rules engine and returns a verdict.",
+)
+async def analyze_nutrition_image(
+    user_id: int = Form(..., description="User profile ID"),
+    file:    UploadFile = File(..., description="Photo of the nutrition-facts label"),
+    db:      AsyncSession = Depends(get_db),
+):
+    profile = await _get_profile_or_404(user_id, db)
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image file")
+
+    ocr = process_ocr_image(image_bytes)
+
+    if ocr["status"] == "error":
+        raise HTTPException(status_code=400,
+                            detail=ocr.get("message", "OCR failed"))
+    if ocr["status"] == "no_text" or not ocr["nutrients"]:
+        preview = " ".join((ocr.get("raw_text") or "").split())[:220]
+        engine = ocr.get("engine", "unknown")
+        extra = f" OCR engine: {engine}. OCR preview: {preview}" if preview else f" OCR engine: {engine}."
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract nutrient values from the image. "
+                   "Make sure the nutrition-facts panel is well-lit and in focus." + extra
+        )
+
+    # Confidence gate: require enough core nutrients so weak scans don't become
+    # misleading 0.0-heavy results after fallback/default filling.
+    core_keys = ["calories", "protein", "carbs", "fat", "sodium"]
+    found_core = [k for k in core_keys if k in ocr["nutrients"]]
+    if len(found_core) < 3:
+        preview = " ".join((ocr.get("raw_text") or "").split())[:220]
+        engine = ocr.get("engine", "unknown")
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Low OCR confidence: only "
+                f"{len(found_core)}/{len(core_keys)} core nutrients were extracted "
+                f"({', '.join(found_core) if found_core else 'none'}). "
+                f"OCR engine: {engine}. OCR preview: {preview}"
+            ),
+        )
+
+    verdict_nutrients: dict = {
+        "calories": 0.0, "protein": 0.0, "carbs": 0.0,
+        "fat":      0.0, "fiber":   0.0, "sugar": 0.0,
+        "sodium":   0.0, "cholesterol": 0.0,
+    }
+    verdict_nutrients.update(ocr["nutrients"])
+
+    # For frontend display, keep only extracted nutrients to avoid fake 0.0 values.
+    display_nutrients = dict(ocr["nutrients"])
+
+    # Build profile dict for medical_rules.hybrid_verdict
+    user_profile_dict = {
+        "diseases":  profile.diseases,
+        "allergies": profile.allergies,
+        "age":       profile.age,
+        "gender":    profile.gender,
+        "height_cm": profile.height_cm,
+        "weight_kg": profile.weight_kg,
+    }
+
+    result = hybrid_verdict(
+        food_nutrients = verdict_nutrients,
+        user_profile   = user_profile_dict,
+        ml_predict_fn  = ml_model.predict,
+    )
+    _enrich_result(result, verdict_nutrients, profile)
+
+    food_info = {
+        "food_item": f"Scanned nutrition label ({ocr['engine']})",
+        **display_nutrients,
+    }
+
+    check_id = await _save_check(
+        db             = db,
+        user_id        = user_id,
+        mode           = "ocr",
+        query          = (ocr.get("raw_text") or "")[:200],
+        food_found     = None,
+        verdict_result = result,
+        nutrients      = verdict_nutrients,
+    )
+
+    return VerdictResponse(
+        verdict       = result["verdict"],
+        score         = result["score"],
+        warnings      = result["warnings"],
+        reasons       = result["reasons"],
+        food_info     = food_info,
+        ml_prediction = result.get("ml_prediction"),
+        bmi           = result.get("bmi"),
+        bmi_note      = result.get("bmi_note"),
+        check_id      = check_id,
+        user_targets  = result.get("user_targets"),
+        budget_impact = result.get("budget_impact"),
+    )

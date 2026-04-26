@@ -29,11 +29,18 @@ Requirements:
   # Windows: download installer from https://github.com/UB-Mannheim/tesseract/wiki
 """
 
+import os
 import re
 import cv2
 import numpy as np
 import pytesseract
 from pathlib import Path
+
+# Windows: set path explicitly so pytesseract finds Tesseract regardless of PATH.
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
 
 
 def preprocess_for_ocr(image_array: np.ndarray) -> np.ndarray:
@@ -55,14 +62,12 @@ def preprocess_for_ocr(image_array: np.ndarray) -> np.ndarray:
     """
     # ── Step 1: Upscale if image is too small ────────────────────────────────
     # Tesseract accuracy drops sharply below ~150 DPI equivalent.
-    # A 600px-wide image of a small label is often below this.
+    # 1500px minimum gives better recognition of small label text.
     h, w = image_array.shape[:2]
-    if w < 1000:
-        # Scale so width = 1000px. Keep aspect ratio.
-        scale  = 1000.0 / w
-        new_w  = 1000
+    if w < 1500:
+        scale  = 1500.0 / w
+        new_w  = 1500
         new_h  = int(h * scale)
-        # INTER_CUBIC: better quality for upscaling (vs INTER_LINEAR)
         image_array = cv2.resize(image_array, (new_w, new_h),
                                  interpolation=cv2.INTER_CUBIC)
 
@@ -71,11 +76,15 @@ def preprocess_for_ocr(image_array: np.ndarray) -> np.ndarray:
     # Grayscale also reduces noise from chromatic aberration.
     gray = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
 
-    # ── Step 3: Denoise ───────────────────────────────────────────────────────
-    # fastNlMeansDenoising removes random pixel noise without blurring edges.
-    # h=10 is a balanced strength: removes noise but preserves thin characters.
-    # Too high (h>15) blurs characters; too low (h<5) doesn't help.
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
+    # ── Step 3: Denoise then sharpen ─────────────────────────────────────────
+    # Denoise first to remove JPEG noise, then apply unsharp mask to
+    # restore edge crispness lost during denoising (especially for blurry
+    # phone photos where the text may be soft-focused).
+    denoised = cv2.fastNlMeansDenoising(gray, h=7)
+    _blurred = cv2.GaussianBlur(denoised, (0, 0), sigmaX=3)
+    denoised = np.clip(
+        cv2.addWeighted(denoised, 1.5, _blurred, -0.5, 0), 0, 255
+    ).astype(np.uint8)
 
     # ── Step 4: Adaptive threshold ────────────────────────────────────────────
     # Converts each pixel to pure black or white.
@@ -93,16 +102,15 @@ def preprocess_for_ocr(image_array: np.ndarray) -> np.ndarray:
 
     # ── Step 5: Deskew ────────────────────────────────────────────────────────
     # Food labels photographed at an angle produce slanted text.
-    # minAreaRect finds the angle of the text block and we rotate to correct it.
+    # Clamp to ±15° — decorative elements (arrows, circles in educational
+    # screenshots) can push minAreaRect to large wrong angles that flip
+    # the entire image, making OCR output completely garbled.
     coords = np.column_stack(np.where(thresh > 0))
     if len(coords) > 0:
-        # angle is the rotation needed to make text horizontal
         angle = cv2.minAreaRect(coords)[-1]
-        # minAreaRect returns angles in [-90, 0]; correct to actual rotation
         if angle < -45:
             angle = 90 + angle
-        # Only deskew if tilt is noticeable (>0.5°) — avoid unnecessary transformation
-        if abs(angle) > 0.5:
+        if 0.5 < abs(angle) < 15:
             (h2, w2) = thresh.shape
             center   = (w2 // 2, h2 // 2)
             M        = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -164,21 +172,26 @@ def extract_text_from_path(image_path: str | Path) -> str:
 def _run_tesseract(bgr_image: np.ndarray) -> str:
     """
     Internal helper: preprocess + run Tesseract on a BGR image array.
-    
-    Tesseract config:
-      --oem 3  : use LSTM neural network engine (most accurate)
-      --psm 6  : assume a uniform block of text (good for ingredient lists)
-                 psm 4 (single column) is also worth trying for narrow labels
+
+    Tries PSM 4 (single column) then PSM 6 (block), with bilingual eng+ben
+    falling back to eng-only if Bengali tessdata is not installed.
+    Picks the result with the most text content.
     """
     preprocessed = preprocess_for_ocr(bgr_image)
 
-    # Tesseract config string
-    # oem 3 = LSTM + legacy (best accuracy)
-    # psm 6 = assume a single uniform block of text
-    config = r"--oem 3 --psm 6 -l eng"
+    best = ""
+    for psm in (4, 6):
+        for lang in ("eng+ben", "eng"):
+            cfg = f"--oem 3 --psm {psm} --dpi 300"
+            try:
+                out = pytesseract.image_to_string(preprocessed, lang=lang, config=cfg)
+            except pytesseract.TesseractError:
+                continue
+            if len(out) > len(best):
+                best = out
+            break  # if eng+ben succeeded, don't also try eng for same PSM
 
-    text = pytesseract.image_to_string(preprocessed, config=config)
-    return text.strip()
+    return best.strip()
 
 
 def find_ingredients_section(full_text: str) -> str:
