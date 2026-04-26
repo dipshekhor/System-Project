@@ -1,0 +1,413 @@
+﻿"""
+ocr_service.py
+==============
+Two-tier OCR for nutrition-fact label parsing (English + Bangla).
+
+Design goal: stable extraction with simple rules.
+- Match nutrient keywords directly.
+- Read the immediate next number after keyword on the same line.
+- Require unit for non-calorie nutrients.
+- If calories has no unit, treat as kcal.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import logging
+from collections import Counter
+
+import cv2
+import numpy as np
+import pytesseract
+
+# Windows: set path explicitly so pytesseract finds Tesseract regardless of PATH.
+if os.name == "nt":
+    pytesseract.pytesseract.tesseract_cmd = (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+
+try:
+    from google.cloud import vision  # type: ignore
+    _VISION_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _VISION_AVAILABLE = False
+
+
+log = logging.getLogger(__name__)
+
+
+NUTRIENT_KEYWORDS: dict[str, list[str]] = {
+    "calories": ["calories", "energy", "kcal", "ক্যালরি", "শক্তি"],
+    "protein": ["protein", "আমিষ", "প্রোটিন"],
+    "carbs": ["carbohydrate", "carbohydrates", "carbs", "শর্করা", "কার্বোহাইড্রেট"],
+    "fat": ["fat", "lipid", "total fat", "চর্বি", "স্নেহ"],
+    "sugar": ["sugar", "sugars", "চিনি", "সুগার"],
+    "sodium": ["sodium", "salt", "লবণ", "সোডিয়াম"],
+    "cholesterol": ["cholesterol", "কোলেস্টেরল"],
+    "fiber": ["fiber", "fibre", "dietary fiber", "আঁশ", "ফাইবার"],
+}
+
+_BN_DIGIT_MAP = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+_UNIT_TO_FACTOR_G = {
+    "g": 1.0,
+    "gm": 1.0,
+    "গ্রাম": 1.0,
+    "mg": 0.001,
+    "মিগ্রা": 0.001,
+    "মিলিগ্রাম": 0.001,
+    "kg": 1000.0,
+}
+_UNIT_TO_FACTOR_MG = {
+    "mg": 1.0,
+    "মিগ্রা": 1.0,
+    "মিলিগ্রাম": 1.0,
+    "g": 1000.0,
+    "gm": 1000.0,
+    "গ্রাম": 1000.0,
+}
+
+_NUM_ANY_RE = re.compile(
+    r"([0-9]+(?:[.,][0-9]+)?)\s*"
+    r"(kcal|kj|mg|g|gm|kg|গ্রাম|মিগ্রা|মিলিগ্রাম|কিজু)?",
+    re.IGNORECASE,
+)
+
+_NUTRIENT_MAX: dict[str, float] = {
+    "calories": 1500.0,
+    "protein": 200.0,
+    "carbs": 300.0,
+    "fat": 200.0,
+    "sugar": 200.0,
+    "fiber": 100.0,
+    "sodium": 5000.0,
+    "cholesterol": 800.0,
+}
+
+
+def _run_google_vision(image_bytes: bytes) -> str | None:
+    if not _VISION_AVAILABLE:
+        return None
+    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return None
+    try:
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=image_bytes)
+        ctx = vision.ImageContext(language_hints=["bn", "en"])
+        resp = client.document_text_detection(image=image, image_context=ctx)
+        if resp.error.message:
+            log.warning("Vision API error: %s", resp.error.message)
+            return None
+        if resp.full_text_annotation and resp.full_text_annotation.text:
+            return resp.full_text_annotation.text
+        return None
+    except Exception as exc:  # pragma: no cover
+        log.warning("Google Vision call failed: %s", exc)
+        return None
+
+
+def _deskew(binary: np.ndarray) -> np.ndarray:
+    coords = np.column_stack(np.where(binary > 0))
+    if len(coords) == 0:
+        return binary
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = 90 + angle
+    if abs(angle) < 0.5 or abs(angle) > 15:
+        return binary
+    h, w = binary.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(
+        binary,
+        M,
+        (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _decode_image(image_bytes: bytes) -> np.ndarray:
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image bytes")
+
+    h, w = img.shape[:2]
+    if w < 1200:
+        scale = 1200.0 / w
+        img = cv2.resize(img, (1200, int(h * scale)), interpolation=cv2.INTER_CUBIC)
+    return img
+
+
+def _preprocess_variants(image_bytes: bytes) -> list[np.ndarray]:
+    img = _decode_image(image_bytes)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, h=10)
+
+    adaptive = cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=11,
+        C=2,
+    )
+    _, otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    h, w = denoised.shape[:2]
+    y0, y1 = int(h * 0.08), int(h * 0.92)
+    x0, x1 = int(w * 0.12), int(w * 0.88)
+    crop = denoised[y0:y1, x0:x1]
+
+    variants = [_deskew(adaptive), _deskew(otsu), denoised]
+    if crop.size > 0:
+        crop_adaptive = cv2.adaptiveThreshold(
+            crop,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=11,
+            C=2,
+        )
+        variants.append(_deskew(crop_adaptive))
+    return variants
+
+
+def _keyword_hit_count(text: str) -> int:
+    low = text.lower()
+    hits = 0
+    for keywords in NUTRIENT_KEYWORDS.values():
+        for kw in keywords:
+            if kw.lower() in low:
+                hits += 1
+                break
+    return hits
+
+
+def _normalise_value(num_str: str, unit: str | None, target_key: str) -> float:
+    num = float(num_str)
+    if unit is None:
+        return num
+    unit = unit.strip().lower()
+
+    if target_key in ("sodium", "cholesterol"):
+        return num * _UNIT_TO_FACTOR_MG.get(unit, 1.0)
+    if target_key in ("protein", "fat", "carbs", "fiber", "sugar"):
+        return num * _UNIT_TO_FACTOR_G.get(unit, 1.0)
+    if target_key == "calories":
+        if unit in ("kj", "কিজু"):
+            return num / 4.184
+        return num
+    return num
+
+
+def _is_allowed_unit(target_key: str, unit: str) -> bool:
+    unit = unit.strip().lower()
+    if target_key == "calories":
+        return unit in ("kcal", "kj", "কিজু")
+    if target_key in ("sodium", "cholesterol"):
+        return unit in ("mg", "g", "gm", "kg", "মিগ্রা", "মিলিগ্রাম", "গ্রাম")
+    if target_key in ("protein", "fat", "carbs", "fiber", "sugar"):
+        return unit in ("g", "gm", "mg", "kg", "গ্রাম", "মিগ্রা", "মিলিগ্রাম")
+    return True
+
+
+def _extract_first_number(window: str, target_key: str) -> float | None:
+    clean = window if target_key == "calories" else re.sub(r"\b\d+\s*%", "", window)
+
+    for m in _NUM_ANY_RE.finditer(clean):
+        raw_num = m.group(1).replace(",", ".")
+        raw_unit = m.group(2)
+
+        if target_key == "calories" and not raw_unit:
+            raw_unit = "kcal"
+
+        if target_key != "calories" and not raw_unit:
+            continue
+        if raw_unit and not _is_allowed_unit(target_key, raw_unit):
+            continue
+
+        try:
+            value = _normalise_value(raw_num, raw_unit, target_key)
+        except ValueError:
+            continue
+
+        if value <= _NUTRIENT_MAX.get(target_key, 1e9):
+            return value
+    return None
+
+
+def _strip_to_section(text: str) -> str:
+    headers = [
+        "nutrition facts",
+        "nutritional information",
+        "nutritional value",
+        "p nutrition",
+        "nutrition",
+        "পুষ্টি",
+        "পুষ্টিগুণ",
+    ]
+    low = text.lower()
+    best = -1
+    for h in headers:
+        idx = low.find(h)
+        if idx != -1 and (best == -1 or idx < best):
+            best = idx
+    return text[best:] if best != -1 else text
+
+
+def _find_keyword_index(line: str, keywords: list[str]) -> tuple[int, str] | None:
+    line_low = line.lower()
+    best_idx = -1
+    best_kw = ""
+    for kw in keywords:
+        kw_low = kw.lower()
+        for m in re.finditer(re.escape(kw_low), line_low):
+            start = m.start()
+            end = m.end()
+            prev_ok = start == 0 or not line_low[start - 1].isalpha()
+            next_ok = end == len(line_low) or not line_low[end].isalpha()
+            if not (prev_ok and next_ok):
+                continue
+            if best_idx == -1 or start < best_idx:
+                best_idx = start
+                best_kw = kw
+            break
+    if best_idx == -1:
+        return None
+    return best_idx, best_kw
+
+
+def parse_nutrients(raw_text: str) -> dict[str, float]:
+    if not raw_text:
+        return {}
+
+    text = _strip_to_section(raw_text).translate(_BN_DIGIT_MAP)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    found: dict[str, float] = {}
+
+    for line in lines:
+        for nutrient, keywords in NUTRIENT_KEYWORDS.items():
+            if nutrient in found:
+                continue
+            hit = _find_keyword_index(line, keywords)
+            if not hit:
+                continue
+            best_idx, best_kw = hit
+            after_kw = line[best_idx + len(best_kw):]
+            value = _extract_first_number(after_kw, nutrient)
+            if value is not None:
+                found[nutrient] = round(value, 2)
+
+    return found
+
+
+def _run_tesseract_multi(image_bytes: bytes) -> tuple[str, dict[str, float]]:
+    variants = _preprocess_variants(image_bytes)
+
+    def _ocr(img: np.ndarray, psm: int, lang: str) -> str:
+        config = f"--oem 3 --psm {psm}"
+        try:
+            return pytesseract.image_to_string(img, lang=lang, config=config)
+        except pytesseract.TesseractError:
+            if lang != "eng":
+                return pytesseract.image_to_string(img, lang="eng", config=config)
+            return ""
+
+    texts: list[tuple[str, int]] = []
+    parses: list[dict[str, float]] = []
+    for img in variants:
+        for psm, lang in ((6, "eng"), (11, "eng"), (6, "eng+ben")):
+            text = _ocr(img, psm, lang)
+            if not text:
+                continue
+            parsed = parse_nutrients(text)
+            score = (len(parsed) * 100) + _keyword_hit_count(text)
+            texts.append((text, score))
+            parses.append(parsed)
+
+    if not texts:
+        return "", {}
+
+    voted: dict[str, float] = {}
+    all_keys = set().union(*(p.keys() for p in parses))
+    for key in all_keys:
+        values = [p[key] for p in parses if key in p]
+        counts = Counter(values).most_common()
+        if counts:
+            voted[key] = counts[0][0]
+
+    raw_text = max(texts, key=lambda item: item[1])[0]
+    return raw_text, voted
+
+
+def process_ocr_image(image_bytes: bytes) -> dict:
+    if not image_bytes:
+        return {
+            "status": "error",
+            "engine": "none",
+            "nutrients": {},
+            "raw_text": "",
+            "message": "Empty image bytes",
+        }
+
+    raw_text: str | None = None
+    nutrients: dict[str, float] = {}
+    engine = "tesseract"
+
+    g_text = _run_google_vision(image_bytes)
+    g_nutrients: dict[str, float] = {}
+    if g_text:
+        g_nutrients = parse_nutrients(g_text)
+
+    try:
+        tess_text, tess_nutrients = _run_tesseract_multi(image_bytes)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "engine": "none",
+            "nutrients": {},
+            "raw_text": "",
+            "message": str(exc),
+        }
+
+    def _quality(n: dict[str, float]) -> int:
+        core = ("calories", "protein", "carbs", "fat", "sodium")
+        core_hits = sum(1 for k in core if k in n)
+        return len(n) * 100 + core_hits * 50
+
+    if _quality(tess_nutrients) >= _quality(g_nutrients):
+        raw_text = tess_text or g_text or ""
+        nutrients = tess_nutrients or g_nutrients
+        engine = "tesseract" if tess_text else "google"
+    else:
+        raw_text = g_text or tess_text or ""
+        nutrients = g_nutrients
+        engine = "google"
+
+    if not raw_text or not raw_text.strip():
+        return {"status": "no_text", "engine": engine, "nutrients": {}, "raw_text": ""}
+
+    return {
+        "status": "success" if nutrients else "no_text",
+        "engine": engine,
+        "nutrients": nutrients,
+        "raw_text": raw_text,
+    }
+
+
+if __name__ == "__main__":
+    sample = """
+    Nutrition Facts
+    Serving size 30g
+    Calories 230
+    Protein 8 g
+    Total Fat 12g
+    Carbohydrate 28g
+    Sugars 10 g
+    Sodium 320 mg
+    Cholesterol 5 mg
+    Dietary Fiber 4g
+    """
+    print(parse_nutrients(sample))

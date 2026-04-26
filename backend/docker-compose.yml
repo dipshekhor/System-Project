@@ -64,6 +64,8 @@ services:
       DATABASE_URL: postgresql+asyncpg://foodapp:foodapp123@postgres:5432/food_recommendation
       # Change this to a long random string in production!
       SECRET_KEY: change_this_in_production_please
+      # Google Cloud Vision credentials (Tier 1 OCR)
+      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/evocative-radar-494421-p9-0101c87eb327.json
       # Phase 1 verification model (runtime-compatible, float32)
       TEAMMATE_MODEL_PATH: /app/model_assets/food_model_v214_baseline.tflite
       TEAMMATE_CLASS_NAMES_PATH: /app/model_assets/class_names.json
@@ -79,6 +81,7 @@ services:
       # Mount teammate image-model assets (.tflite + class names)
       # Uses the backend-local model folder so files are always present in-container.
       - ./model_assets_food:/app/model_assets:ro
+
     depends_on:
       postgres:
         # Wait for Postgres healthcheck to pass before starting FastAPI.

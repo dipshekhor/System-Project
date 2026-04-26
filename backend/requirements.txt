@@ -29,6 +29,9 @@ opencv-python-headless==4.9.0.80
 pillow==10.3.0
 tflite-runtime==2.14.0
 
+# Bilingual OCR — Tier 1 engine (optional; falls back to Tesseract if missing)
+google-cloud-vision==3.7.2
+
 # HTTP client
 httpx==0.27.0
 
