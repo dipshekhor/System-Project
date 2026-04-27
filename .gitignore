@@ -6,3 +6,7 @@ backend/.env
 .ipynb_checkpoints/
 .DS_Store
 
+# Google Cloud service-account credentials
+backend/credentials/*.json
+!backend/credentials/.gitkeep
+

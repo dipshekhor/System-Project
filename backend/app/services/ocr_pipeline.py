@@ -36,6 +36,8 @@ import numpy as np
 import pytesseract
 from pathlib import Path
 
+from app.services.ocr_service import _run_google_vision
+
 # Windows: set path explicitly so pytesseract finds Tesseract regardless of PATH.
 if os.name == "nt":
     pytesseract.pytesseract.tesseract_cmd = (
@@ -126,20 +128,23 @@ def preprocess_for_ocr(image_array: np.ndarray) -> np.ndarray:
 def extract_text_from_bytes(image_bytes: bytes) -> str:
     """
     Run full OCR pipeline on raw image bytes (from HTTP file upload).
-    
-    This is the function called by the FastAPI /analyze-ocr-image endpoint.
-    The frontend sends the photo as bytes; this function returns the extracted text.
-    
+
+    Tries Google Vision first; falls back to Tesseract if Vision is unavailable
+    or returns no text.
+
     Args:
         image_bytes: raw bytes of the image file (JPEG, PNG, etc.)
-    
+
     Returns:
         Extracted text string from the image
-    
+
     Raises:
         ValueError: if image_bytes cannot be decoded as an image
     """
-    # Decode bytes → numpy array (like imread but from memory)
+    vision_text = _run_google_vision(image_bytes)
+    if vision_text and vision_text.strip():
+        return vision_text.strip()
+
     nparr = np.frombuffer(image_bytes, np.uint8)
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -154,19 +159,19 @@ def extract_text_from_bytes(image_bytes: bytes) -> str:
 def extract_text_from_path(image_path: str | Path) -> str:
     """
     Run full OCR pipeline on an image file path.
-    
+
     Used for local testing — pass a file path string or Path object.
-    
+
     Args:
         image_path: path to JPEG, PNG, or other image file
-    
+
     Returns:
         Extracted text string
     """
-    img = cv2.imread(str(image_path))
-    if img is None:
+    image_path = Path(image_path)
+    if not image_path.exists():
         raise FileNotFoundError(f"Could not read image at: {image_path}")
-    return _run_tesseract(img)
+    return extract_text_from_bytes(image_path.read_bytes())
 
 
 def _run_tesseract(bgr_image: np.ndarray) -> str:
