@@ -1,4 +1,4 @@
-﻿"""
+"""
 ocr_service.py
 ==============
 Two-tier OCR for nutrition-fact label parsing (English + Bangla).
@@ -16,6 +16,7 @@ import os
 import re
 import logging
 from collections import Counter
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -38,13 +39,13 @@ log = logging.getLogger(__name__)
 
 
 NUTRIENT_KEYWORDS: dict[str, list[str]] = {
-    "calories": ["calories", "energy", "kcal", "ক্যালরি", "শক্তি"],
+    "calories": ["calories", "calorie", "cal0ries", "ca1ories", "calorles", "caiories", "energy", "kcal", "ক্যালরি", "ক্যালোরি", "শক্তি"],
     "protein": ["protein", "আমিষ", "প্রোটিন"],
     "carbs": ["carbohydrate", "carbohydrates", "carbs", "শর্করা", "কার্বোহাইড্রেট"],
     "fat": ["fat", "lipid", "total fat", "চর্বি", "স্নেহ"],
     "sugar": ["sugar", "sugars", "চিনি", "সুগার"],
-    "sodium": ["sodium", "salt", "লবণ", "সোডিয়াম"],
-    "cholesterol": ["cholesterol", "কোলেস্টেরল"],
+    "sodium": ["sodium", "sodlum", "sodiurn", "sodim", "salt", "লবণ", "সোডিয়াম"],
+    "cholesterol": ["cholesterol", "choiesterol", "cholesteroi", "choiesteroi", "কোলেস্টেরল"],
     "fiber": ["fiber", "fibre", "dietary fiber", "আঁশ", "ফাইবার"],
 }
 
@@ -54,6 +55,7 @@ _UNIT_TO_FACTOR_G = {
     "g": 1.0,
     "gm": 1.0,
     "গ্রাম": 1.0,
+    "গ্রা": 1.0,   # Bangla abbreviated gram (গ্রা: is common on local labels)
     "mg": 0.001,
     "মিগ্রা": 0.001,
     "মিলিগ্রাম": 0.001,
@@ -66,30 +68,45 @@ _UNIT_TO_FACTOR_MG = {
     "g": 1000.0,
     "gm": 1000.0,
     "গ্রাম": 1000.0,
+    "গ্রা": 1000.0,  # Bangla abbreviated gram
 }
 
 _NUM_ANY_RE = re.compile(
     r"([0-9]+(?:[.,][0-9]+)?)\s*"
-    r"(kcal|kj|mg|g|gm|kg|গ্রাম|মিগ্রা|মিলিগ্রাম|কিজু)?",
+    r"(kcal|kj|mg|g|gm|kg|গ্রাম|গ্রা|মিগ্রা|মিলিগ্রাম|কিজু)?",
     re.IGNORECASE,
 )
 
-_NUTRIENT_MAX: dict[str, float] = {
-    "calories": 1500.0,
-    "protein": 200.0,
-    "carbs": 300.0,
-    "fat": 200.0,
-    "sugar": 200.0,
-    "fiber": 100.0,
-    "sodium": 5000.0,
-    "cholesterol": 800.0,
-}
+_SECTION_VALUE_HINT_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*(?:kcal|kj|mg|g|gm|kg|গ্রাম|গ্রা|মিগ্রা|মিলিগ্রাম|কিজু)\b",
+    re.IGNORECASE,
+)
 
+_URL_NOISE_RE = re.compile(
+    r"(?:https?://|www\.|\.com\b|search\?|google\.|chrome|youtube|facebook)",
+    re.IGNORECASE,
+)
+
+# Words/patterns that indicate a number is a serving-size measure, not a calorie count.
+# /\d catches fraction numerators like "2" in "2/3 cup".
+_SERVING_UNIT_RE = re.compile(
+    r"^\s*(?:/\d|cups?|tbsp|tsp|fl\.?\s*oz|oz|ml|m[Ll]|litr[es]?|servings?|pieces?|slices?|packets?)",
+    re.IGNORECASE,
+)
 
 def _run_google_vision(image_bytes: bytes) -> str | None:
+    global _VISION_AVAILABLE, vision
+
     if not _VISION_AVAILABLE:
-        return None
-    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        try:
+            from google.cloud import vision as _vision  # type: ignore
+            vision = _vision
+            _VISION_AVAILABLE = True
+        except Exception:
+            return None
+
+    cred_path = _ensure_google_credentials_env()
+    if not cred_path:
         return None
     try:
         client = vision.ImageAnnotatorClient()
@@ -101,10 +118,40 @@ def _run_google_vision(image_bytes: bytes) -> str | None:
             return None
         if resp.full_text_annotation and resp.full_text_annotation.text:
             return resp.full_text_annotation.text
+
+        # Some label photos return better results with text_detection.
+        resp2 = client.text_detection(image=image, image_context=ctx)
+        if resp2.error.message:
+            log.warning("Vision text_detection error: %s", resp2.error.message)
+            return None
+        if resp2.full_text_annotation and resp2.full_text_annotation.text:
+            return resp2.full_text_annotation.text
+
+        if resp2.text_annotations:
+            return resp2.text_annotations[0].description
+
         return None
     except Exception as exc:  # pragma: no cover
         log.warning("Google Vision call failed: %s", exc)
         return None
+
+
+def _ensure_google_credentials_env() -> str | None:
+    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    cred_dir = Path(__file__).resolve().parents[2] / "credentials"
+    if not cred_dir.exists():
+        return None
+
+    json_files = sorted(cred_dir.glob("*.json"))
+    if not json_files:
+        return None
+
+    detected = str(json_files[0])
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = detected
+    return detected
 
 
 def _deskew(binary: np.ndarray) -> np.ndarray:
@@ -207,24 +254,52 @@ def _is_allowed_unit(target_key: str, unit: str) -> bool:
     if target_key == "calories":
         return unit in ("kcal", "kj", "কিজু")
     if target_key in ("sodium", "cholesterol"):
-        return unit in ("mg", "g", "gm", "kg", "মিগ্রা", "মিলিগ্রাম", "গ্রাম")
+        return unit in ("mg", "g", "gm", "kg", "মিগ্রা", "মিলিগ্রাম", "গ্রাম", "গ্রা")
     if target_key in ("protein", "fat", "carbs", "fiber", "sugar"):
-        return unit in ("g", "gm", "mg", "kg", "গ্রাম", "মিগ্রা", "মিলিগ্রাম")
+        return unit in ("g", "gm", "mg", "kg", "গ্রাম", "গ্রা", "মিগ্রা", "মিলিগ্রাম")
     return True
 
 
 def _extract_first_number(window: str, target_key: str) -> float | None:
-    clean = window if target_key == "calories" else re.sub(r"\b\d+\s*%", "", window)
+    # Percentage figures (e.g., Daily Value 10%) are noise for nutrient value extraction.
+    clean = re.sub(r"\b\d+(?:[.,]\d+)?\s*%", "", window)
+
+    # OCR often reads zero as letter O in nutrient lines (e.g., "Omg" instead of "0mg").
+    clean = re.sub(r"\b[Oo](?=\s*(?:kcal|kj|mg|g|gm|kg|গ্রাম|গ্রা|মিগ্রা|মিলিগ্রাম|কিজু)\b)", "0", clean)
+    clean = re.sub(r"\b[Oo](?=[.,]?\d)", "0", clean)
+
+    if target_key == "calories":
+        # Normalize common OCR confusions inside numeric calorie values (e.g., "23O" -> "230").
+        clean = re.sub(r"(?<=\d)[Oo](?=\d|\b)", "0", clean)
+        clean = re.sub(r"(?<=\d)[Il](?=\d|\b)", "1", clean)
+        clean = re.sub(r"(?<=\d)S(?=\d|\b)", "5", clean)
+        clean = re.sub(r"(?<=\d)B(?=\d|\b)", "8", clean)
 
     for m in _NUM_ANY_RE.finditer(clean):
         raw_num = m.group(1).replace(",", ".")
         raw_unit = m.group(2)
 
         if target_key == "calories" and not raw_unit:
+            # Skip numbers that are followed by a serving-size word (e.g. "1 cup", "2 tbsp").
+            # Those are serving-size measurements, not calorie counts.
+            if _SERVING_UNIT_RE.match(clean[m.end():]):
+                continue
             raw_unit = "kcal"
 
         if target_key != "calories" and not raw_unit:
-            continue
+            # OCR often drops units for sodium/cholesterol; treat as mg by default.
+            if target_key in ("sodium", "cholesterol"):
+                raw_unit = "mg"
+            elif target_key in ("protein", "fat", "carbs", "sugar", "fiber"):
+                # Bangla table layouts often use ":" as a cell separator with no unit.
+                # If the number is followed only by ":" (or end of text), treat as grams.
+                rest = clean[m.end():].lstrip()
+                if rest.startswith(":") or rest == "":
+                    raw_unit = "g"
+                else:
+                    continue
+            else:
+                continue
         if raw_unit and not _is_allowed_unit(target_key, raw_unit):
             continue
 
@@ -232,29 +307,63 @@ def _extract_first_number(window: str, target_key: str) -> float | None:
             value = _normalise_value(raw_num, raw_unit, target_key)
         except ValueError:
             continue
+        return value
 
-        if value <= _NUTRIENT_MAX.get(target_key, 1e9):
-            return value
     return None
 
 
 def _strip_to_section(text: str) -> str:
     headers = [
         "nutrition facts",
+        "nutrition information",
         "nutritional information",
         "nutritional value",
         "p nutrition",
         "nutrition",
+        "পুষ্টি তথ্য",
+        "পুষ্টি বিষয়ক তথ্য",
         "পুষ্টি",
         "পুষ্টিগুণ",
     ]
     low = text.lower()
-    best = -1
+
+    # Browser screenshots often contain earlier "nutrition" text in URL/tab chrome.
+    # Pick the section whose following window looks most like a nutrient table.
+    candidates: list[int] = []
     for h in headers:
-        idx = low.find(h)
-        if idx != -1 and (best == -1 or idx < best):
-            best = idx
-    return text[best:] if best != -1 else text
+        pos = 0
+        while True:
+            idx = low.find(h, pos)
+            if idx == -1:
+                break
+            candidates.append(idx)
+            pos = idx + 1
+
+    if not candidates:
+        return text
+
+    best_idx = candidates[0]
+    best_score = -1
+    for idx in candidates:
+        window = text[idx: idx + 1400]
+        score = (_keyword_hit_count(window) * 5) + len(_SECTION_VALUE_HINT_RE.findall(window))
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return text[best_idx:]
+
+
+def _is_noise_line(line: str) -> bool:
+    if _URL_NOISE_RE.search(line):
+        return True
+
+    # Drop browser/tab lines that are mostly ASCII words and punctuation.
+    alpha = sum(ch.isalpha() for ch in line)
+    if alpha == 0:
+        return False
+    ascii_alpha = sum(ch.isascii() and ch.isalpha() for ch in line)
+    return (ascii_alpha / alpha) > 0.9 and ("nutrition" in line.lower() or "search" in line.lower())
 
 
 def _find_keyword_index(line: str, keywords: list[str]) -> tuple[int, str] | None:
@@ -284,10 +393,11 @@ def parse_nutrients(raw_text: str) -> dict[str, float]:
         return {}
 
     text = _strip_to_section(raw_text).translate(_BN_DIGIT_MAP)
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not _is_noise_line(ln.strip())]
     found: dict[str, float] = {}
+    keyword_positions: dict[str, int] = {}  # nutrient -> line index where keyword found
 
-    for line in lines:
+    for i, line in enumerate(lines):
         for nutrient, keywords in NUTRIENT_KEYWORDS.items():
             if nutrient in found:
                 continue
@@ -296,9 +406,88 @@ def parse_nutrients(raw_text: str) -> dict[str, float]:
                 continue
             best_idx, best_kw = hit
             after_kw = line[best_idx + len(best_kw):]
-            value = _extract_first_number(after_kw, nutrient)
-            if value is not None:
-                found[nutrient] = round(value, 2)
+            # Skip "Calories from Fat" lines — we want total calories only.
+            if nutrient == "calories" and re.match(r"\s*from\b", after_kw, re.IGNORECASE):
+                continue
+            keyword_positions.setdefault(nutrient, i)
+            # OCR may split "Calories" and "230" across lines. Try nearby windows.
+            candidate_windows = [after_kw]
+            if i + 1 < len(lines):
+                nxt = lines[i + 1]
+                candidate_windows.append(nxt)
+                candidate_windows.append(f"{after_kw} {nxt}")
+            if nutrient == "calories" and i + 2 < len(lines):
+                nxt2 = lines[i + 2]
+                candidate_windows.append(f"{after_kw} {lines[i + 1]} {nxt2}")
+
+            for window in candidate_windows:
+                value = _extract_first_number(window, nutrient)
+                if value is not None:
+                    found[nutrient] = round(value, 2)
+                    break
+
+    # Column-separated table fallback: Google Vision sometimes outputs a table
+    # column-by-column, putting all values BEFORE all keywords. Collect every
+    # value-with-unit token from the full text in order, then assign leftover
+    # values to leftover keywords by the order their keywords first appeared.
+    missing = [k for k in NUTRIENT_KEYWORDS if k not in found and k in keyword_positions]
+    if missing:
+        used_values: set[float] = {round(v, 2) for v in found.values()}
+        all_tokens: list[tuple[float, str]] = []  # (value, unit)
+        for m in re.finditer(
+            r"([0-9]+(?:[.,][0-9]+)?)\s*"
+            r"(kcal|kj|mg|g|gm|kg|গ্রাম|গ্রা|মিগ্রা|মিলিগ্রাম|কিজু)",
+            text,
+            re.IGNORECASE,
+        ):
+            try:
+                num = float(m.group(1).replace(",", "."))
+            except ValueError:
+                continue
+            unit = m.group(2) or ""
+            all_tokens.append((num, unit))
+
+        # Sort missing nutrients by where their keyword appeared in the text.
+        missing_sorted = sorted(missing, key=lambda k: keyword_positions[k])
+        for nutrient in missing_sorted:
+            for idx, (num, unit) in enumerate(all_tokens):
+                if not unit:
+                    continue
+                if not _is_allowed_unit(nutrient, unit):
+                    continue
+                try:
+                    value = round(_normalise_value(str(num), unit, nutrient), 2)
+                except ValueError:
+                    continue
+                if value in used_values:
+                    continue
+                # Plausibility: reject obviously wrong magnitudes per nutrient.
+                if nutrient == "calories" and (value < 1 or value > 2000):
+                    continue
+                if nutrient in ("protein", "fat", "carbs", "fiber", "sugar") and value > 200:
+                    continue
+                if nutrient == "sodium" and value > 5000:
+                    continue
+                found[nutrient] = value
+                used_values.add(value)
+                all_tokens.pop(idx)
+                break
+
+    # Last resort for calories in noisy OCR where line matching failed.
+    if "calories" not in found:
+        low_text = text.lower()
+        cal_fallback_re = re.compile(
+            r"(?:calories|calorie|cal0ries|ca1ories|calorles|caiories|energy|kcal|ক্যালরি|ক্যালোরি|শক্তি)"
+            r"(?!\s*from\b)"
+            r"[^0-9]{0,40}([0-9]+(?:[.,][0-9]+)?)",
+            re.IGNORECASE,
+        )
+        m = cal_fallback_re.search(low_text)
+        if m:
+            try:
+                found["calories"] = round(float(m.group(1).replace(",", ".")), 2)
+            except ValueError:
+                pass
 
     return found
 
@@ -318,7 +507,7 @@ def _run_tesseract_multi(image_bytes: bytes) -> tuple[str, dict[str, float]]:
     texts: list[tuple[str, int]] = []
     parses: list[dict[str, float]] = []
     for img in variants:
-        for psm, lang in ((6, "eng"), (11, "eng"), (6, "eng+ben")):
+        for psm, lang in ((4, "eng+ben"), (6, "eng+ben"), (11, "eng+ben"), (4, "eng"), (6, "eng"), (11, "eng")):
             text = _ocr(img, psm, lang)
             if not text:
                 continue
@@ -354,37 +543,35 @@ def process_ocr_image(image_bytes: bytes) -> dict:
 
     raw_text: str | None = None
     nutrients: dict[str, float] = {}
-    engine = "tesseract"
+    engine = "google"
 
     g_text = _run_google_vision(image_bytes)
     g_nutrients: dict[str, float] = {}
     if g_text:
         g_nutrients = parse_nutrients(g_text)
 
-    try:
-        tess_text, tess_nutrients = _run_tesseract_multi(image_bytes)
-    except ValueError as exc:
-        return {
-            "status": "error",
-            "engine": "none",
-            "nutrients": {},
-            "raw_text": "",
-            "message": str(exc),
-        }
-
-    def _quality(n: dict[str, float]) -> int:
-        core = ("calories", "protein", "carbs", "fat", "sodium")
-        core_hits = sum(1 for k in core if k in n)
-        return len(n) * 100 + core_hits * 50
-
-    if _quality(tess_nutrients) >= _quality(g_nutrients):
-        raw_text = tess_text or g_text or ""
-        nutrients = tess_nutrients or g_nutrients
-        engine = "tesseract" if tess_text else "google"
-    else:
-        raw_text = g_text or tess_text or ""
+    # Google Vision is always preferred for Bangla text — its output is far more
+    # accurate than Tesseract. Only fall back to Tesseract when Vision returns
+    # nothing at all (credentials missing, network error, etc.).
+    if g_text and g_text.strip():
+        raw_text = g_text
         nutrients = g_nutrients
         engine = "google"
+    else:
+        try:
+            tess_text, tess_nutrients = _run_tesseract_multi(image_bytes)
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "engine": "none",
+                "nutrients": {},
+                "raw_text": "",
+                "message": str(exc),
+            }
+
+        raw_text = tess_text or ""
+        nutrients = tess_nutrients
+        engine = "tesseract" if tess_text else "none"
 
     if not raw_text or not raw_text.strip():
         return {"status": "no_text", "engine": engine, "nutrients": {}, "raw_text": ""}
